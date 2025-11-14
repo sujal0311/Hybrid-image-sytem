@@ -9,14 +9,19 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // Middleware
+// ✅ UPDATED CORS - Allow your frontend
 app.use(cors({
   origin: [
-    'http://localhost:5173',
-    'http://localhost:3000',
-    'https://imagesystem2025.netlify.app', // ← Add your frontend URL
-    'https://*.vercel.app'
+    'http://localhost:3000',      // ← React dev server
+    'http://localhost:5173',      // ← Vite dev server
+    'http://localhost:5174',
+    'https://your-frontend.vercel.app', // ← Add your deployed frontend URL
+    /\.vercel\.app$/,             // ← Allow all Vercel domains
+    /\.netlify\.app$/             // ← Allow Netlify if you use it
   ],
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
