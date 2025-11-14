@@ -1,3 +1,4 @@
+# python/steganography.py - FIXED VERSION
 import sys
 import json
 import numpy as np
@@ -5,6 +6,12 @@ from PIL import Image
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 import os
+import io
+
+# ✅ FIX: Redirect ALL prints to stderr EXCEPT final JSON
+def log(message):
+    """Safe logging to stderr"""
+    print(message, file=sys.stderr, flush=True)
 
 def calculate_entropy(data):
     """Calculate Shannon entropy"""
@@ -40,9 +47,9 @@ def embed_lsb_fast(cover_image, secret_data):
             cover_image = cover_image.convert('RGB')
         
         cover_array = np.array(cover_image, dtype=np.uint8)
-        print(f'Cover array shape: {cover_array.shape}', file=sys.stderr)
+        log(f'Cover array shape: {cover_array.shape}')
         
-        # Convert data to bit array (much faster than string concatenation)
+        # Convert data to bit array
         data_bits = np.unpackbits(np.frombuffer(secret_data, dtype=np.uint8))
         data_length = len(data_bits)
         
@@ -52,7 +59,7 @@ def embed_lsb_fast(cover_image, secret_data):
         # Combine header + data
         all_bits = np.concatenate([length_bits, data_bits])
         
-        print(f'Total bits to embed: {len(all_bits)}', file=sys.stderr)
+        log(f'Total bits to embed: {len(all_bits)}')
         
         # Check capacity
         flat_cover = cover_array.flatten()
@@ -61,24 +68,24 @@ def embed_lsb_fast(cover_image, secret_data):
         if len(all_bits) > capacity:
             raise ValueError(f'Cover too small: need {len(all_bits)} bits, have {capacity}')
         
-        print(f'Flattened cover size: {len(flat_cover)}', file=sys.stderr)
+        log(f'Flattened cover size: {len(flat_cover)}')
         
-        # FAST EMBEDDING: Clear LSB and set new bits (vectorized)
-        print(f'Embedding {len(all_bits)} bits...', file=sys.stderr)
+        # FAST EMBEDDING
+        log(f'Embedding {len(all_bits)} bits...')
         flat_cover[:len(all_bits)] = (flat_cover[:len(all_bits)] & 0xFE) | all_bits
         
-        print(f'Embedding complete, reshaping...', file=sys.stderr)
+        log('Embedding complete, reshaping...')
         
         # Reshape and create image
         stego_array = flat_cover.reshape(cover_array.shape)
         stego_image = Image.fromarray(stego_array, mode='RGB')
         
-        print(f'Stego image created successfully', file=sys.stderr)
+        log('Stego image created successfully')
         
         return stego_image
         
     except Exception as e:
-        print(f'LSB embedding error: {str(e)}', file=sys.stderr)
+        log(f'LSB embedding error: {str(e)}')
         raise
 
 def extract_lsb_fast(stego_image):
@@ -89,46 +96,45 @@ def extract_lsb_fast(stego_image):
         
         stego_array = np.array(stego_image, dtype=np.uint8).flatten()
         
-        print(f'Extracting from {len(stego_array)} pixels', file=sys.stderr)
+        log(f'Extracting from {len(stego_array)} pixels')
         
         # Extract length (first 32 bits)
         length_bits = stego_array[:32] & 1
         data_length = int(''.join(str(b) for b in length_bits), 2)
         
-        print(f'Data length: {data_length} bits', file=sys.stderr)
+        log(f'Data length: {data_length} bits')
         
         if data_length <= 0 or data_length > len(stego_array) - 32:
             raise ValueError(f'Invalid data length: {data_length}')
         
-        # Extract data bits (vectorized)
+        # Extract data bits
         data_bits = stego_array[32:32+data_length] & 1
         
-        print(f'Extracted {len(data_bits)} bits, converting to bytes...', file=sys.stderr)
+        log(f'Extracted {len(data_bits)} bits, converting to bytes...')
         
-        # Convert bits to bytes (NumPy packbits is MUCH faster)
-        # Pad to multiple of 8
+        # Convert bits to bytes
         remainder = len(data_bits) % 8
         if remainder != 0:
             data_bits = np.concatenate([data_bits, np.zeros(8 - remainder, dtype=np.uint8)])
         
         secret_bytes = np.packbits(data_bits).tobytes()
         
-        print(f'Converted to {len(secret_bytes)} bytes', file=sys.stderr)
+        log(f'Converted to {len(secret_bytes)} bytes')
         
         return secret_bytes
         
     except Exception as e:
-        print(f'LSB extraction error: {str(e)}', file=sys.stderr)
+        log(f'LSB extraction error: {str(e)}')
         raise
 
 def encrypt_with_steganography(secret_path, cover_path, key, chaotic_map='logistic'):
     """Triple-layer encryption with FAST embedding"""
     try:
-        print(f'Starting steganography encryption...', file=sys.stderr)
+        log('Starting steganography encryption...')
         
         # Load secret
         secret_img = Image.open(secret_path)
-        print(f'Secret image loaded: {secret_img.size}, mode: {secret_img.mode}', file=sys.stderr)
+        log(f'Secret image loaded: {secret_img.size}, mode: {secret_img.mode}')
         
         if secret_img.mode not in ['RGB', 'L']:
             secret_img = secret_img.convert('RGB')
@@ -143,12 +149,12 @@ def encrypt_with_steganography(secret_path, cover_path, key, chaotic_map='logist
             'dtype': str(secret_array.dtype)
         }
         
-        print(f'Secret image: {secret_array.shape}, mode: {secret_img.mode}', file=sys.stderr)
+        log(f'Secret image: {secret_array.shape}, mode: {secret_img.mode}')
         
         # Scramble
         scrambled, _ = simple_scramble(secret_array)
         secret_bytes = scrambled.tobytes()
-        print(f'Scrambled size: {len(secret_bytes)} bytes', file=sys.stderr)
+        log(f'Scrambled size: {len(secret_bytes)} bytes')
         
         # Metadata
         metadata_json = json.dumps(metadata).encode('utf-8')
@@ -162,7 +168,7 @@ def encrypt_with_steganography(secret_path, cover_path, key, chaotic_map='logist
         padded_data = pad(secret_bytes, AES.block_size)
         encrypted_data = cipher.encrypt(padded_data)
         
-        print(f'Encrypted size: {len(encrypted_data)} bytes', file=sys.stderr)
+        log(f'Encrypted size: {len(encrypted_data)} bytes')
         
         encrypted_entropy = calculate_entropy(np.frombuffer(encrypted_data, dtype=np.uint8))
         
@@ -174,11 +180,11 @@ def encrypt_with_steganography(secret_path, cover_path, key, chaotic_map='logist
             encrypted_data
         )
         
-        print(f'Total data to embed: {len(full_data)} bytes', file=sys.stderr)
+        log(f'Total data to embed: {len(full_data)} bytes')
         
         # Load cover
         cover_img = Image.open(cover_path)
-        print(f'Cover image loaded: {cover_img.size}, mode: {cover_img.mode}', file=sys.stderr)
+        log(f'Cover image loaded: {cover_img.size}, mode: {cover_img.mode}')
         
         if cover_img.mode != 'RGB':
             cover_img = cover_img.convert('RGB')
@@ -187,7 +193,7 @@ def encrypt_with_steganography(secret_path, cover_path, key, chaotic_map='logist
         cover_size = cover_img.size[0] * cover_img.size[1] * 3
         required_bits = len(full_data) * 8 + 32
         
-        print(f'Cover capacity: {cover_size} bits, Required: {required_bits} bits', file=sys.stderr)
+        log(f'Cover capacity: {cover_size} bits, Required: {required_bits} bits')
         
         if required_bits > cover_size:
             return {
@@ -196,19 +202,26 @@ def encrypt_with_steganography(secret_path, cover_path, key, chaotic_map='logist
             }
         
         # FAST EMBED
-        print(f'Starting FAST LSB embedding...', file=sys.stderr)
+        log('Starting FAST LSB embedding...')
         stego_img = embed_lsb_fast(cover_img, full_data)
         
         # Save
         output_dir = os.path.dirname(cover_path)
+        if not output_dir:
+            output_dir = '/tmp/uploads/stego'
+        
+        # Ensure directory exists
+        os.makedirs(output_dir, exist_ok=True)
+        
         base_name = os.path.splitext(os.path.basename(cover_path))[0]
         stego_path = os.path.join(output_dir, f"{base_name}_stego.png")
         
-        print(f'Saving stego image...', file=sys.stderr)
+        log(f'Saving stego image to: {stego_path}')
         stego_img.save(stego_path, 'PNG')
         
-        print(f'✅ Stego image saved: {stego_path}', file=sys.stderr)
+        log(f'✅ Stego image saved successfully')
         
+        # ✅ Return JSON result
         return {
             'success': True,
             'stego_path': stego_path,
@@ -223,7 +236,7 @@ def encrypt_with_steganography(secret_path, cover_path, key, chaotic_map='logist
         }
         
     except Exception as e:
-        print(f'❌ Encryption failed: {str(e)}', file=sys.stderr)
+        log(f'❌ Encryption failed: {str(e)}')
         import traceback
         traceback.print_exc(file=sys.stderr)
         return {
@@ -234,30 +247,30 @@ def encrypt_with_steganography(secret_path, cover_path, key, chaotic_map='logist
 def decrypt_from_steganography(stego_path, key):
     """Triple-layer decryption with FAST extraction"""
     try:
-        print(f'Starting steganography decryption...', file=sys.stderr)
+        log('Starting steganography decryption...')
         
         # Load stego
         stego_img = Image.open(stego_path)
-        print(f'Stego image loaded: {stego_img.size}', file=sys.stderr)
+        log(f'Stego image loaded: {stego_img.size}')
         
         # FAST EXTRACT
         extracted_data = extract_lsb_fast(stego_img)
-        print(f'Extracted {len(extracted_data)} bytes', file=sys.stderr)
+        log(f'Extracted {len(extracted_data)} bytes')
         
         # Parse metadata
         metadata_length = int.from_bytes(extracted_data[:4], byteorder='big')
-        print(f'Metadata length: {metadata_length}', file=sys.stderr)
+        log(f'Metadata length: {metadata_length}')
         
         metadata_json = extracted_data[4:4+metadata_length]
         metadata = json.loads(metadata_json.decode('utf-8'))
-        print(f'Metadata: {metadata}', file=sys.stderr)
+        log(f'Metadata: {metadata}')
         
         # Get IV and encrypted
         iv_start = 4 + metadata_length
         iv = extracted_data[iv_start:iv_start+16]
         encrypted_data = extracted_data[iv_start+16:]
         
-        print(f'Encrypted data size: {len(encrypted_data)} bytes', file=sys.stderr)
+        log(f'Encrypted data size: {len(encrypted_data)} bytes')
         
         # Decrypt
         key_bytes = key.encode('utf-8')[:32].ljust(32, b'\0')
@@ -265,9 +278,9 @@ def decrypt_from_steganography(stego_path, key):
         
         try:
             decrypted_data = unpad(cipher.decrypt(encrypted_data), AES.block_size)
-            print(f'Decrypted data size: {len(decrypted_data)} bytes', file=sys.stderr)
+            log(f'Decrypted data size: {len(decrypted_data)} bytes')
         except:
-            return {'success': False, 'error': 'Invalid key'}
+            return {'success': False, 'error': 'Invalid key or corrupted data'}
         
         # Reconstruct
         shape = tuple(metadata['shape'])
@@ -282,10 +295,15 @@ def decrypt_from_steganography(stego_path, key):
         # Save
         img = Image.fromarray(img_array.astype(np.uint8), mode=metadata['mode'])
         output_dir = os.path.dirname(stego_path)
+        if not output_dir:
+            output_dir = '/tmp/uploads/decrypted'
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
         output_path = os.path.join(output_dir, f"extracted_{os.path.basename(stego_path)}")
         img.save(output_path)
         
-        print(f'✅ Extracted: {output_path}', file=sys.stderr)
+        log(f'✅ Extracted image saved: {output_path}')
         
         return {
             'success': True,
@@ -294,33 +312,36 @@ def decrypt_from_steganography(stego_path, key):
         }
         
     except Exception as e:
-        print(f'❌ Decryption failed: {str(e)}', file=sys.stderr)
+        log(f'❌ Decryption failed: {str(e)}')
         import traceback
         traceback.print_exc(file=sys.stderr)
         return {'success': False, 'error': str(e)}
 
 def main():
-    if len(sys.argv) < 2:
-        print(json.dumps({'success': False, 'error': 'Invalid arguments'}))
-        return
-    
-    command = sys.argv[1]
-    
+    """Main entry point - prints ONLY JSON to stdout"""
     try:
-        if command == 'encrypt' and len(sys.argv) >= 5:
+        if len(sys.argv) < 2:
+            result = {'success': False, 'error': 'No command specified'}
+        elif sys.argv[1] == 'encrypt' and len(sys.argv) >= 5:
             result = encrypt_with_steganography(
-                sys.argv[2], sys.argv[3], sys.argv[4],
+                sys.argv[2], 
+                sys.argv[3], 
+                sys.argv[4],
                 sys.argv[5] if len(sys.argv) > 5 else 'logistic'
             )
-        elif command == 'decrypt' and len(sys.argv) >= 4:
+        elif sys.argv[1] == 'decrypt' and len(sys.argv) >= 4:
             result = decrypt_from_steganography(sys.argv[2], sys.argv[3])
         else:
-            result = {'success': False, 'error': 'Invalid command'}
+            result = {'success': False, 'error': 'Invalid command or arguments'}
         
-        print(json.dumps(result))
+        # ✅ CRITICAL: Print ONLY JSON to stdout (no extra text!)
+        print(json.dumps(result), flush=True)
         
     except Exception as e:
-        print(json.dumps({'success': False, 'error': str(e)}))
+        log(f'Fatal error in main: {str(e)}')
+        error_result = {'success': False, 'error': str(e)}
+        print(json.dumps(error_result), flush=True)
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
