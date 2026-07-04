@@ -1,530 +1,766 @@
-// routes/encryption.js - OPTIMIZED FOR RENDER
-const express = require('express');
+const express = require("express");
 const router = express.Router();
-const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
-const { exec } = require('child_process');
-const os = require('os');
-const EncryptedImage = require('../models/EncryptedImage');
+const multer = require("multer");
+const path = require("path");
+const fs = require("fs");
+const { exec } = require("child_process");
+const os = require("os");
+const EncryptedImage = require("../models/EncryptedMedia");
 
-// ✅ RENDER-COMPATIBLE PYTHON DETECTION
-const getPythonCommand = () => {
-  if (process.env.RENDER) {
-    return 'python3'; // Render uses python3
-  }
-  return os.platform() === 'win32' ? 'python' : 'python3';
+// ── Python Config ─────────────────────────────────────────────────────────────
+const PYTHON_CMD = process.env.RENDER
+  ? "python3"
+  : os.platform() === "win32"
+    ? "python"
+    : "python3";
+
+const SCRIPTS = {
+  image: path.join(__dirname, "../python/encryption.py"),
+  stego: path.join(__dirname, "../python/steganography.py"),
+  audioStego: path.join(__dirname, "../python/audio_steganography.py"),
+  videoStego: path.join(__dirname, "../python/video_steganography.py"),
+  metrics: path.join(__dirname, "../python/metrics_analyzer.py"),
+  video: path.join(__dirname, "../python/video_encryption.py"),
+  audio: path.join(__dirname, "../python/audio_encryption.py"),
 };
 
-const PYTHON_CMD = getPythonCommand();
+// ── Helper: Clean Metrics for Mongoose ────────────────────────────────────────
+const cleanMetrics = (metrics) => {
+  if (!metrics) return { encryptionTime: 0 };
+  const cleaned = { ...metrics };
 
-// ✅ HELPER: RUN PYTHON SCRIPTS WITH PROPER ERROR HANDLING
-const runPythonScript = (scriptPath, args = []) => {
-  return new Promise((resolve, reject) => {
-    const argsString = args.map(arg => `"${arg}"`).join(' ');
-    const command = `${PYTHON_CMD} "${scriptPath}" ${argsString}`;
-    
-    console.log('🐍 Running:', command);
-    
-    exec(command, {
-      timeout: 30000,
-      maxBuffer: 50 * 1024 * 1024,
-      encoding: 'utf-8'
-    }, (error, stdout, stderr) => {
-      if (error) {
-        console.error('❌ Python error:', stderr);
-        reject(new Error(stderr || error.message));
-        return;
-      }
-      
-      try {
-        const result = JSON.parse(stdout.trim());
-        resolve(result);
-      } catch (parseError) {
-        console.error('❌ Parse error:', stdout);
-        reject(new Error(`Failed to parse: ${stdout}`));
-      }
-    });
+  // Ensure encryptionTime is a number
+  if (cleaned.encryptionTime) {
+    cleaned.encryptionTime = parseFloat(cleaned.encryptionTime) || 0;
+  } else {
+    cleaned.encryptionTime = 0;
+  }
+
+  // Handle PSNR edge cases
+  if (cleaned.psnr === "inf" || cleaned.psnr === Infinity) {
+    cleaned.psnr = 9999;
+  } else if (cleaned.psnr && typeof cleaned.psnr === "string") {
+    cleaned.psnr = parseFloat(cleaned.psnr.replace(/[^\d.]/g, "")) || 0;
+  }
+
+  return cleaned;
+};
+
+// ── Run Python ────────────────────────────────────────────────────────────────
+const runPython = (scriptPath, args = []) =>
+  new Promise((resolve, reject) => {
+    const escaped = args
+      .map((a) => `"${String(a).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`)
+      .join(" ");
+    const cmd = `${PYTHON_CMD} "${scriptPath}" ${escaped}`;
+
+    console.log("🐍 Running:", cmd);
+
+    const child = exec(
+      cmd,
+      {
+        timeout: 30 * 60 * 1000,
+        maxBuffer: 2 * 1024 * 1024 * 1024,
+        encoding: "utf-8",
+      },
+      (err, stdout, stderr) => {
+        if (stderr) console.warn("Python stderr:", stderr.slice(0, 500));
+        if (err) {
+          if (err.killed) {
+            return reject(
+              new Error(
+                `Process timeout after 30 minutes - file may be too large`,
+              ),
+            );
+          }
+          return reject(new Error(stderr || err.message));
+        }
+
+        try {
+          resolve(JSON.parse(stdout.trim()));
+        } catch {
+          reject(
+            new Error(`Invalid JSON from Python: ${stdout.slice(0, 300)}`),
+          );
+        }
+      },
+    );
+    child.on("error", (err) =>
+      reject(new Error(`Process error: ${err.message}`)),
+    );
   });
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const uploadDir = (sub) => {
+  const base = process.env.RENDER ? "/tmp" : path.join(__dirname, "..");
+  const dir = path.join(base, "uploads", sub);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
 };
 
-// ✅ RENDER-COMPATIBLE MULTER CONFIGURATION
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    // Use /tmp for Render's ephemeral storage
-    const uploadDir = process.env.RENDER 
-      ? path.join('/tmp', 'uploads', 'original')
-      : path.join(__dirname, '../uploads/original');
-    
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, uniqueSuffix + '-' + file.originalname);
-  }
-});
-
-const upload = multer({ 
-  storage: storage,
-  limits: { fileSize: 50 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    cb(null, true);
-  }
-});
-
-// ==================== ENCRYPT WITH METRICS ====================
-router.post('/encrypt', upload.single('image'), async (req, res) => {
-  const startTime = Date.now();
-  
-  try {
-    const { key, chaoticMap = 'logistic' } = req.body;
-    
-    if (!req.file) {
-      return res.status(400).json({ error: 'No image file uploaded' });
-    }
-    
-    if (!key || key.length < 8) {
-      return res.status(400).json({ error: 'Key must be at least 8 characters' });
-    }
-
-    const imagePath = req.file.path;
-    const originalName = req.file.originalname;
-    const baseName = path.basename(originalName, path.extname(originalName));
-    const timestamp = Date.now();
-    const encryptedName = `${baseName}_encrypted_${timestamp}.bin`;
-    
-    const encryptionScript = path.join(__dirname, '../python/encryption.py');
-    const metricsScript = path.join(__dirname, '../python/metrics_analyzer.py');
-
-    console.log('🔒 Step 1: Encrypting:', originalName);
-    console.log('📍 Python command:', PYTHON_CMD);
-    console.log('📍 Script path:', encryptionScript);
-
-    // ✅ STEP 1: Encrypt the image
-    const encryptResult = await runPythonScript(encryptionScript, [
-      'encrypt',
-      imagePath,
-      key,
-      chaoticMap
-    ]);
-    
-    if (!encryptResult.success) {
-      return res.status(500).json({ 
-        error: encryptResult.error || 'Encryption failed' 
-      });
-    }
-    
-    const encryptionTime = Date.now() - startTime;
-    const encryptedPath = encryptResult.encrypted_path;
-    
-    // ✅ STEP 2: Calculate security metrics
-    console.log('📊 Step 2: Calculating metrics...');
-    let calculatedMetrics = {
-      encryptionTime: encryptionTime,
-      entropy: { original: 0, encrypted: 0 },
-      NPCR: 0,
-      UACI: 0,
-      correlation: 0,
-      PSNR: 0,
-      MSE: 0
-    };
-    
+const del = (...paths) =>
+  paths.forEach((p) => {
     try {
-      const metricsResult = await runPythonScript(metricsScript, [
-        'encryption',
-        imagePath,
-        encryptedPath
-      ]);
-      
-      if (metricsResult.success) {
-        calculatedMetrics = {
-          encryptionTime: encryptionTime,
-          entropy: metricsResult.entropy || { original: 0, encrypted: 0 },
-          NPCR: metricsResult.npcr || 0,
-          UACI: metricsResult.uaci || 0,
-          correlation: metricsResult.correlation || 0,
-          PSNR: 0,
-          MSE: 0
-        };
-        console.log('✅ Metrics calculated:', {
-          NPCR: calculatedMetrics.NPCR,
-          UACI: calculatedMetrics.UACI,
-          entropy: calculatedMetrics.entropy.encrypted
-        });
-      }
-    } catch (metricsError) {
-      console.warn('⚠️ Metrics calculation failed, using defaults:', metricsError.message);
-    }
+      if (p && fs.existsSync(p)) fs.unlinkSync(p);
+    } catch (_) {}
+  });
 
-    // ✅ STEP 3: Save to database
-    const newImage = new EncryptedImage({
-      originalName: originalName,
-      encryptedName: encryptedName,
-      encryptedPath: encryptedPath,
-      originalPath: imagePath,
+// ── FIX: Reliable filename builder for decrypted outputs ─────────────────────
+/**
+ * Strips any encrypted-file suffixes and returns a clean base name.
+ * Examples:
+ *   "photo_encrypted.bin"       → "photo"
+ *   "photo_encrypted_decrypted" → "photo"   (edge case from Python output path)
+ *   "cover_stego.png"           → "cover_stego"
+ *   "audio_encrypted.abin"      → "audio"
+ *   "video_encrypted.vbin"      → "video"
+ */
+const cleanBaseName = (filename) =>
+  path
+    .basename(filename, path.extname(filename)) // strip extension
+    .replace(/_encrypted(_decrypted)?$/, "") // strip _encrypted or _encrypted_decrypted
+    .replace(/_decrypted$/, ""); // strip lone _decrypted
+
+const extFromType = (type = "") =>
+  ({
+    "JPEG Image": ".jpg",
+    "PNG Image": ".png",
+    "GIF Image": ".gif",
+    "PDF Document": ".pdf",
+    "WAV Audio": ".wav",
+    "MP3 Audio": ".mp3",
+    "Text File": ".txt",
+    GZIP: ".gz",
+    "ZIP Archive": ".zip",
+    "Binary Data": ".bin",
+  })[type] || ".bin";
+
+// ── Multer Configurations ─────────────────────────────────────────────────────
+const imageMulter = multer({
+  storage: multer.diskStorage({
+    destination: (_, __, cb) => cb(null, uploadDir("original")),
+    filename: (_, file, cb) => cb(null, `${Date.now()}-${file.originalname}`),
+  }),
+  limits: { fileSize: 1 * 1024 * 1024 * 1024 }, // 1 GB - supports large high-res images
+});
+
+const videoMulter = multer({
+  storage: multer.diskStorage({
+    destination: (_, __, cb) => cb(null, uploadDir("video")),
+    filename: (_, file, cb) => cb(null, `${Date.now()}-${file.originalname}`),
+  }),
+  limits: { fileSize: 4 * 1024 * 1024 * 1024 }, // 4 GB - supports large videos
+});
+
+const audioMulter = multer({
+  storage: multer.diskStorage({
+    destination: (_, __, cb) => cb(null, uploadDir("audio")),
+    filename: (_, file, cb) => cb(null, `${Date.now()}-${file.originalname}`),
+  }),
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 }, // 2 GB - supports long audio recordings
+});
+
+const secretMulter = multer({
+  storage: multer.diskStorage({
+    destination: (_, __, cb) => cb(null, uploadDir("stego")),
+    filename: (_, file, cb) =>
+      cb(null, `${Date.now()}-secret-${file.originalname}`),
+  }),
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 }, // 2 GB - supports large steganography operations
+});
+
+// ── Temp-file store ───────────────────────────────────────────────────────────
+const tempExtracted = new Map();
+
+// Purge expired entries every 5 minutes
+setInterval(
+  () => {
+    const now = Date.now();
+    for (const [id, item] of tempExtracted.entries()) {
+      if (now > item.expires) {
+        del(item.path);
+        tempExtracted.delete(id);
+      }
+    }
+  },
+  5 * 60 * 1000,
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. IMAGE ENCRYPTION
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post("/encrypt", imageMulter.single("image"), async (req, res) => {
+  try {
+    const { key, chaoticMap = "logistic" } = req.body;
+    if (!req.file || !key)
+      return res.status(400).json({ error: "Image and key required" });
+
+    const result = await runPython(SCRIPTS.image, [
+      "encrypt",
+      req.file.path,
+      key,
+      chaoticMap,
+    ]);
+    if (!result.success) throw new Error(result.error);
+
+    console.log(
+      "🐍 Image encryption metrics received:",
+      JSON.stringify(result.metrics, null, 2),
+    );
+    const cleanedMetrics = cleanMetrics(result.metrics);
+    console.log(
+      "✅ Cleaned metrics for DB:",
+      JSON.stringify(cleanedMetrics, null, 2),
+    );
+
+    const doc = await new EncryptedImage({
+      originalName: req.file.originalname,
+      encryptedName: path.basename(result.encrypted_path),
+      encryptedPath: result.encrypted_path,
+      originalPath: req.file.path,
       size: req.file.size,
       mimeType: req.file.mimetype,
-      chaoticMap: chaoticMap,
-      encryptionType: 'basic',
-      status: 'completed',
-      metrics: calculatedMetrics
-    });
+      mediaType: "image",
+      chaoticMap,
+      encryptionType: "basic",
+      metrics: cleanedMetrics,
+      status: "completed",
+    }).save();
 
-    await newImage.save();
+    console.log(
+      "✅ Document saved with metrics:",
+      JSON.stringify(doc.metrics, null, 2),
+    );
 
-    console.log('✅ Encryption successful with metrics, ID:', newImage._id);
-
-    res.json({
-      success: true,
-      message: 'Image encrypted successfully',
-      imageId: newImage._id,
-      encryptedName: encryptedName,
-      encryptionTime: encryptionTime,
-      metrics: calculatedMetrics
-    });
-    
+    res.json({ success: true, fileId: doc._id, metrics: result.metrics });
   } catch (error) {
-    console.error('❌ Server error:', error);
+    if (req.file) del(req.file.path);
     res.status(500).json({ error: error.message });
   }
 });
 
-// ==================== DECRYPT ====================
-router.post('/decrypt', upload.single('image'), async (req, res) => {
+// ── FIX: Image Decrypt ────────────────────────────────────────────────────────
+router.post("/decrypt", imageMulter.single("image"), async (req, res) => {
   try {
     const { key } = req.body;
-    
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
-    }
-    
-    if (!key) {
-      return res.status(400).json({ error: 'Decryption key required' });
-    }
+    if (!req.file || !key)
+      return res.status(400).json({ error: "File and key required" });
 
-    const encryptedPath = req.file.path;
-    const pythonScript = path.join(__dirname, '../python/encryption.py');
-
-    console.log('🔓 Decrypting file...');
-
-    const result = await runPythonScript(pythonScript, [
-      'decrypt',
-      encryptedPath,
-      key
-    ]);
-
-    if (!result.success) {
-      // Clean up
-      try {
-        fs.unlinkSync(encryptedPath);
-      } catch (cleanupError) {
-        console.error('Cleanup error:', cleanupError);
-      }
-      
-      return res.status(500).json({ 
-        error: result.error || 'Decryption failed',
-        hint: 'Make sure you are using the correct encryption key'
-      });
-    }
-
-    const decryptedPath = result.decrypted_path;
-    
-    console.log('✅ Decryption successful');
-    
-    if (!fs.existsSync(decryptedPath)) {
-      throw new Error('Decrypted file not found');
-    }
-    
-    // Send file for download
-    res.download(decryptedPath, 'decrypted_image.png', (downloadError) => {
-      if (downloadError) {
-        console.error('❌ Download error:', downloadError);
-      }
-      
-      // Clean up files
-      try {
-        if (fs.existsSync(encryptedPath)) {
-          fs.unlinkSync(encryptedPath);
-        }
-        if (fs.existsSync(decryptedPath)) {
-          fs.unlinkSync(decryptedPath);
-        }
-        console.log('✅ Cleanup completed');
-      } catch (cleanupError) {
-        console.error('⚠️ Cleanup error:', cleanupError);
-      }
-    });
-
-  } catch (error) {
-    console.error('❌ Server error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ==================== STEGANOGRAPHY ENCRYPT WITH METRICS ====================
-router.post('/encrypt-stego', upload.fields([
-  { name: 'secretImage', maxCount: 1 },
-  { name: 'coverImage', maxCount: 1 }
-]), async (req, res) => {
-  const startTime = Date.now();
-  
-  try {
-    const { key, chaoticMap = 'logistic' } = req.body;
-    
-    if (!req.files || !req.files.secretImage || !req.files.coverImage) {
-      return res.status(400).json({ error: 'Both secret and cover images required' });
-    }
-    
-    if (!key || key.length < 8) {
-      return res.status(400).json({ error: 'Key must be at least 8 characters' });
-    }
-    
-    const secretPath = req.files.secretImage[0].path;
-    const coverPath = req.files.coverImage[0].path;
-    
-    const stegoScript = path.join(__dirname, '../python/steganography.py');
-    const metricsScript = path.join(__dirname, '../python/metrics_analyzer.py');
-
-    console.log('🎭 Step 1: Steganography encryption...');
-
-    // Step 1: Create stego image
-    const stegoResult = await runPythonScript(stegoScript, [
-      'encrypt',
-      secretPath,
-      coverPath,
+    const result = await runPython(SCRIPTS.image, [
+      "decrypt",
+      req.file.path,
       key,
-      chaoticMap
     ]);
-    
-    if (!stegoResult.success) {
-      return res.status(500).json({ 
-        error: stegoResult.error || 'Steganography failed' 
-      });
-    }
-    
-    const encryptionTime = Date.now() - startTime;
-    const stegoPath = stegoResult.stego_path;
-    const stegoName = path.basename(stegoPath);
-    
-    // Step 2: Calculate PSNR and MSE
-    console.log('📊 Step 2: Calculating stego metrics...');
-    let calculatedMetrics = {
-      encryptionTime: encryptionTime,
-      entropy: { original: 0, encrypted: 0 },
-      NPCR: 0,
-      UACI: 0,
-      correlation: 0,
-      PSNR: 0,
-      MSE: 0
-    };
-    
-    try {
-      const metricsResult = await runPythonScript(metricsScript, [
-        'steganography',
-        coverPath,
-        stegoPath
-      ]);
-      
-      if (metricsResult.success) {
-        calculatedMetrics.PSNR = metricsResult.psnr || 0;
-        calculatedMetrics.MSE = metricsResult.mse || 0;
-        console.log('✅ Stego metrics:', { 
-          PSNR: calculatedMetrics.PSNR, 
-          MSE: calculatedMetrics.MSE 
-        });
+    if (!result.success) throw new Error(result.error);
+
+    // ✅ FIX: Return the decrypted image blob directly, not a JSON URL
+    const base = cleanBaseName(req.file.originalname);
+    const filename = `decrypted_${base}.png`;
+
+    // Send the decrypted image file directly as blob
+    res.download(result.decrypted_path, filename, (err) => {
+      if (!err) {
+        // Clean up after successful download
+        setTimeout(() => {
+          del(result.decrypted_path);
+        }, 5000);
       }
-    } catch (metricsError) {
-      console.warn('⚠️ Stego metrics failed, using defaults:', metricsError.message);
-    }
-    
-    const newImage = new EncryptedImage({
-      originalName: req.files.secretImage[0].originalname,
-      encryptedName: stegoName,
-      encryptedPath: stegoPath,
-      originalPath: secretPath,
-      size: req.files.secretImage[0].size,
-      mimeType: req.files.secretImage[0].mimetype,
-      chaoticMap: chaoticMap,
-      encryptionType: 'steganography',
-      status: 'completed',
-      metrics: calculatedMetrics
     });
-
-    await newImage.save();
-
-    console.log('✅ Steganography successful with metrics');
-
-    res.json({
-      success: true,
-      message: 'Triple-layer steganography successful',
-      imageId: newImage._id,
-      stegoName: stegoName,
-      encryptionTime: encryptionTime,
-      metrics: calculatedMetrics
-    });
-    
   } catch (error) {
-    console.error('❌ Server error:', error);
     res.status(500).json({ error: error.message });
+  } finally {
+    if (req.file) del(req.file.path);
   }
 });
 
-// ==================== STEGANOGRAPHY DECRYPT ====================
-router.post('/decrypt-stego', upload.single('image'), async (req, res) => {
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. IMAGE STEGANOGRAPHY
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post(
+  "/encrypt-stego",
+  secretMulter.fields([
+    { name: "secretImage", maxCount: 1 },
+    { name: "coverImage", maxCount: 1 },
+  ]),
+  async (req, res) => {
+    try {
+      const { key, chaoticMap = "logistic" } = req.body;
+      if (!req.files?.secretImage || !req.files?.coverImage || !key)
+        return res.status(400).json({ error: "Missing required files or key" });
+
+      const result = await runPython(SCRIPTS.stego, [
+        "encrypt",
+        req.files.secretImage[0].path,
+        req.files.coverImage[0].path,
+        key,
+        chaoticMap,
+      ]);
+      if (!result.success) throw new Error(result.error);
+
+      const doc = await new EncryptedImage({
+        originalName: req.files.secretImage[0].originalname,
+        encryptedName: path.basename(result.stego_path),
+        encryptedPath: result.stego_path,
+        size: req.files.secretImage[0].size,
+        mimeType: "image/png",
+        mediaType: "image",
+        encryptionType: "steganography",
+        chaoticMap,
+        metrics: cleanMetrics(result.metrics),
+        status: "completed",
+      }).save();
+
+      res.json({ success: true, fileId: doc._id, metrics: result.metrics });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  },
+);
+
+// ── FIX: Image Stego Decrypt ──────────────────────────────────────────────────
+router.post("/decrypt-stego", imageMulter.single("image"), async (req, res) => {
   try {
     const { key } = req.body;
-    
-    if (!req.file) {
-      return res.status(400).json({ error: 'No stego image uploaded' });
-    }
-    
-    if (!key) {
-      return res.status(400).json({ error: 'Decryption key required' });
-    }
-    
-    const stegoPath = req.file.path;
-    const pythonScript = path.join(__dirname, '../python/steganography.py');
+    if (!req.file || !key)
+      return res.status(400).json({ error: "File and key required" });
 
-    console.log('🎭 Extracting from steganography...');
-
-    const result = await runPythonScript(pythonScript, [
-      'decrypt',
-      stegoPath,
-      key
+    const result = await runPython(SCRIPTS.stego, [
+      "decrypt",
+      req.file.path,
+      key,
     ]);
+    if (!result.success) throw new Error(result.error);
 
-    if (!result.success) {
-      try {
-        fs.unlinkSync(stegoPath);
-      } catch (cleanupError) {
-        console.error('Cleanup error:', cleanupError);
+    // ✅ FIX: Return the extracted image blob directly, not a JSON URL
+    const base = cleanBaseName(req.file.originalname);
+    const filename = `extracted_${base}.png`;
+
+    // Send the extracted image file directly as blob
+    res.download(result.decrypted_path, filename, (err) => {
+      if (!err) {
+        // Clean up after successful download
+        setTimeout(() => {
+          del(result.decrypted_path);
+        }, 5000);
       }
-      
-      return res.status(500).json({ 
-        error: result.error || 'Extraction failed',
-        hint: 'Make sure you are using the correct encryption key'
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  } finally {
+    if (req.file) del(req.file.path);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. VIDEO ENCRYPTION
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post("/encrypt-video", videoMulter.single("video"), async (req, res) => {
+  try {
+    const { key, chaoticMap = "logistic" } = req.body;
+    if (!req.file || !key)
+      return res.status(400).json({ error: "Video and key required" });
+
+    const result = await runPython(SCRIPTS.video, [
+      "encrypt",
+      req.file.path,
+      key,
+      chaoticMap,
+    ]);
+    if (!result.success) throw new Error(result.error);
+
+    const doc = await new EncryptedImage({
+      originalName: req.file.originalname,
+      encryptedName: path.basename(result.encrypted_path),
+      encryptedPath: result.encrypted_path,
+      size: req.file.size,
+      mimeType: req.file.mimetype,
+      mediaType: "video",
+      chaoticMap,
+      metrics: cleanMetrics(result.metrics),
+      status: "completed",
+    }).save();
+
+    res.json({ success: true, fileId: doc._id, metrics: result.metrics });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── FIX: Video Decrypt ────────────────────────────────────────────────────────
+router.post("/decrypt-video", videoMulter.single("video"), async (req, res) => {
+  try {
+    const { key } = req.body;
+    if (!req.file || !key)
+      return res.status(400).json({ error: "File and key required" });
+
+    const result = await runPython(SCRIPTS.video, [
+      "decrypt",
+      req.file.path,
+      key,
+    ]);
+    if (!result.success) throw new Error(result.error);
+
+    // ✅ FIX: Return the decrypted video blob directly, not a JSON URL
+    const base = cleanBaseName(req.file.originalname);
+    const filename = `decrypted_${base}.mp4`;
+
+    // Send the decrypted video file directly as blob
+    res.download(result.decrypted_path, filename, (err) => {
+      if (!err) {
+        // Clean up after successful download
+        setTimeout(() => {
+          del(result.decrypted_path);
+        }, 10000);
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  } finally {
+    if (req.file) del(req.file.path);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. AUDIO ENCRYPTION
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post("/encrypt-audio", audioMulter.single("audio"), async (req, res) => {
+  try {
+    const { key, chaoticMap = "logistic" } = req.body;
+    if (!req.file || !key)
+      return res.status(400).json({ error: "Audio and key required" });
+
+    const result = await runPython(SCRIPTS.audio, [
+      "encrypt",
+      req.file.path,
+      key,
+      chaoticMap,
+    ]);
+    if (!result.success) throw new Error(result.error);
+
+    const doc = await new EncryptedImage({
+      originalName: req.file.originalname,
+      encryptedName: path.basename(result.encrypted_path),
+      encryptedPath: result.encrypted_path,
+      size: req.file.size,
+      mimeType: req.file.mimetype,
+      mediaType: "audio",
+      chaoticMap,
+      metrics: cleanMetrics(result.metrics),
+      status: "completed",
+    }).save();
+
+    res.json({ success: true, fileId: doc._id, metrics: result.metrics });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── FIX: Audio Decrypt ────────────────────────────────────────────────────────
+router.post("/decrypt-audio", audioMulter.single("audio"), async (req, res) => {
+  try {
+    const { key } = req.body;
+    if (!req.file || !key)
+      return res.status(400).json({ error: "File and key required" });
+
+    const result = await runPython(SCRIPTS.audio, [
+      "decrypt",
+      req.file.path,
+      key,
+    ]);
+    if (!result.success) throw new Error(result.error);
+
+    // ✅ FIX: Return the decrypted audio with proper extension handling
+    const base = cleanBaseName(req.file.originalname);
+
+    // Check if file exists
+    if (!fs.existsSync(result.decrypted_path)) {
+      throw new Error(`Decrypted file not found: ${result.decrypted_path}`);
+    }
+
+    // Get actual file extension from path
+    const actualExt = path.extname(result.decrypted_path);
+    const filename = `decrypted_${base}${actualExt}`;
+
+    // Send the decrypted audio file directly as blob with proper filename
+    res.setHeader("X-Filename", filename);
+    res.download(result.decrypted_path, filename, (err) => {
+      if (!err) {
+        // Clean up after successful download
+        setTimeout(() => {
+          del(result.decrypted_path);
+        }, 5000);
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  } finally {
+    if (req.file) del(req.file.path);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. AUDIO STEGANOGRAPHY
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post(
+  "/steganography/audio/hide",
+  secretMulter.fields([
+    { name: "secret", maxCount: 1 },
+    { name: "cover", maxCount: 1 },
+  ]),
+  async (req, res) => {
+    try {
+      const { key, chaoticMap = "logistic" } = req.body;
+      if (!req.files?.secret?.[0] || !req.files?.cover?.[0])
+        return res
+          .status(400)
+          .json({ error: "Secret file and Cover audio required" });
+
+      const outputPath = path.join(
+        uploadDir("stego"),
+        `stego_audio_${Date.now()}.wav`,
+      );
+
+      const result = await runPython(SCRIPTS.audioStego, [
+        "hide",
+        req.files.secret[0].path,
+        req.files.cover[0].path,
+        outputPath,
+        key,
+        chaoticMap,
+      ]);
+      if (!result.success) throw new Error(result.error);
+
+      const doc = await new EncryptedImage({
+        originalName: req.files.secret[0].originalname,
+        encryptedName: path.basename(outputPath),
+        encryptedPath: outputPath,
+        size: req.files.secret[0].size,
+        mimeType: req.files.cover[0].mimetype || "audio/wav",
+        mediaType: "audio",
+        encryptionType: "steganography",
+        chaoticMap,
+        metrics: cleanMetrics(result.metrics),
+        status: "completed",
+      }).save();
+
+      res.json({ success: true, fileId: doc._id, metrics: result.metrics });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
+
+// ── FIX: Audio Stego Reveal ───────────────────────────────────────────────────
+router.post(
+  "/steganography/audio/reveal",
+  audioMulter.single("stego"),
+  async (req, res) => {
+    try {
+      const { key } = req.body;
+      if (!req.file || !key)
+        return res.status(400).json({ error: "Stego audio and key required" });
+
+      const outputPath = path.join(
+        uploadDir("decrypted"),
+        `extracted_${Date.now()}`,
+      );
+
+      const result = await runPython(SCRIPTS.audioStego, [
+        "reveal",
+        req.file.path,
+        outputPath,
+        key,
+      ]);
+      if (!result.success) throw new Error(result.error);
+
+      // ✅ FIX: use detected file type to assign correct extension
+      const ext = extFromType(result.metrics?.file_type);
+      const finalPath = outputPath + ext;
+      if (fs.existsSync(outputPath)) fs.renameSync(outputPath, finalPath);
+
+      // ✅ FIX: Return the extracted file blob directly, not a JSON URL
+      const base = cleanBaseName(req.file.originalname);
+      const filename = `extracted_${base}${ext}`;
+
+      res.download(finalPath, filename, (err) => {
+        if (!err) {
+          // Clean up after successful download
+          setTimeout(() => {
+            del(finalPath);
+          }, 5000);
+        }
       });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    } finally {
+      if (req.file) del(req.file.path);
     }
+  },
+);
 
-    const decryptedPath = result.decrypted_path;
-    
-    console.log('✅ Extraction successful');
-    
-    if (!fs.existsSync(decryptedPath)) {
-      throw new Error('Extracted file not found');
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. VIDEO STEGANOGRAPHY
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post(
+  "/steganography/video/hide",
+  secretMulter.fields([
+    { name: "secret", maxCount: 1 },
+    { name: "cover", maxCount: 1 },
+  ]),
+  async (req, res) => {
+    try {
+      const { key, frameIndex = 0, chaoticMap = "logistic" } = req.body;
+      if (!req.files?.secret?.[0] || !req.files?.cover?.[0])
+        return res
+          .status(400)
+          .json({ error: "Secret file and Cover video required" });
+
+      const outputPath = path.join(
+        uploadDir("stego"),
+        `stego_video_${Date.now()}.avi`,
+      );
+
+      const result = await runPython(SCRIPTS.videoStego, [
+        "hide",
+        req.files.secret[0].path,
+        req.files.cover[0].path,
+        outputPath,
+        key,
+        frameIndex,
+        chaoticMap,
+      ]);
+      if (!result.success) throw new Error(result.error);
+
+      const doc = await new EncryptedImage({
+        originalName: req.files.secret[0].originalname,
+        encryptedName: path.basename(outputPath),
+        encryptedPath: outputPath,
+        size: req.files.secret[0].size,
+        mimeType: req.files.cover[0].mimetype || "video/avi",
+        mediaType: "video",
+        encryptionType: "steganography",
+        chaoticMap,
+        metrics: cleanMetrics(result.metrics),
+        status: "completed",
+      }).save();
+
+      res.json({ success: true, fileId: doc._id, metrics: result.metrics });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
     }
-    
-    res.download(decryptedPath, 'extracted_secret.png', (downloadError) => {
-      if (downloadError) {
-        console.error('❌ Download error:', downloadError);
-      }
-      
-      try {
-        if (fs.existsSync(stegoPath)) {
-          fs.unlinkSync(stegoPath);
+  },
+);
+
+// ── FIX: Video Stego Reveal ───────────────────────────────────────────────────
+router.post(
+  "/steganography/video/reveal",
+  videoMulter.single("stego"),
+  async (req, res) => {
+    try {
+      const { key, frameIndex = 0 } = req.body;
+      if (!req.file || !key)
+        return res.status(400).json({ error: "Stego video and key required" });
+
+      const outputPath = path.join(
+        uploadDir("decrypted"),
+        `extracted_${Date.now()}`,
+      );
+
+      const result = await runPython(SCRIPTS.videoStego, [
+        "reveal",
+        req.file.path,
+        outputPath,
+        key,
+        frameIndex,
+      ]);
+      if (!result.success) throw new Error(result.error);
+
+      // ✅ FIX: use detected file type to assign correct extension
+      const ext = extFromType(result.metrics?.file_type);
+      const finalPath = outputPath + ext;
+      if (fs.existsSync(outputPath)) fs.renameSync(outputPath, finalPath);
+
+      // ✅ FIX: Return the extracted file blob directly, not a JSON URL
+      const base = cleanBaseName(req.file.originalname);
+      const filename = `extracted_${base}${ext}`;
+
+      res.download(finalPath, filename, (err) => {
+        if (!err) {
+          // Clean up after successful download
+          setTimeout(() => {
+            del(finalPath);
+          }, 10000);
         }
-        if (fs.existsSync(decryptedPath)) {
-          fs.unlinkSync(decryptedPath);
-        }
-        console.log('✅ Cleanup completed');
-      } catch (cleanupError) {
-        console.error('⚠️ Cleanup error:', cleanupError);
-      }
-    });
+      });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    } finally {
+      if (req.file) del(req.file.path);
+    }
+  },
+);
 
-  } catch (error) {
-    console.error('❌ Server error:', error);
-    res.status(500).json({ error: error.message });
+// ─────────────────────────────────────────────────────────────────────────────
+// SHARED UTILITY ROUTES
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * ✅ FIX: Download-temp no longer deletes the file inside res.download callback.
+ * Instead it marks the entry as "downloaded" and a short delayed cleanup runs
+ * after 60 s, so a second tap / browser retry still works.
+ */
+router.get("/download-temp/:tempId", (req, res) => {
+  const item = tempExtracted.get(req.params.tempId);
+  if (!item || Date.now() > item.expires) {
+    tempExtracted.delete(req.params.tempId);
+    return res.status(404).json({ error: "File expired or not found" });
+  }
+
+  res.download(item.path, item.filename, (err) => {
+    if (err && !res.headersSent) {
+      return res.status(500).json({ error: "Download failed" });
+    }
+    // Delay cleanup by 60 s to tolerate retries / browser pre-fetch
+    setTimeout(() => {
+      del(item.path);
+      tempExtracted.delete(req.params.tempId);
+    }, 60_000);
+  });
+});
+
+router.get("/download/:id", async (req, res) => {
+  try {
+    const doc = await EncryptedImage.findById(req.params.id);
+    if (!doc || !fs.existsSync(doc.encryptedPath))
+      return res.status(404).json({ error: "File not found" });
+    res.download(doc.encryptedPath, doc.encryptedName);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
-// ==================== GET ALL IMAGES ====================
-router.get('/images', async (req, res) => {
+router.get("/images", async (req, res) => {
   try {
-    const images = await EncryptedImage.find()
-      .sort({ uploadDate: -1 })
-      .limit(100);
-    res.json({ success: true, images });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+    const images = await EncryptedImage.find().sort({ uploadDate: -1 });
+    res.json(images);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
-// ==================== DELETE IMAGE ====================
-router.delete('/images/:id', async (req, res) => {
+router.delete("/images/:id", async (req, res) => {
   try {
-    const image = await EncryptedImage.findByIdAndDelete(req.params.id);
-    if (!image) {
-      return res.status(404).json({ error: 'Image not found' });
-    }
-    
-    // Clean up files
-    if (fs.existsSync(image.encryptedPath)) {
-      fs.unlinkSync(image.encryptedPath);
-    }
-    if (image.originalPath && fs.existsSync(image.originalPath)) {
-      fs.unlinkSync(image.originalPath);
-    }
-    
-    res.json({ success: true, message: 'Image deleted' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ==================== DOWNLOAD ENCRYPTED FILE ====================
-router.get('/download/:id', async (req, res) => {
-  try {
-    const image = await EncryptedImage.findById(req.params.id);
-    if (!image) {
-      return res.status(404).json({ error: 'Image not found' });
-    }
-    res.download(image.encryptedPath, image.encryptedName);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ==================== DOWNLOAD STEGO IMAGE ====================
-router.get('/download-stego/:id', async (req, res) => {
-  try {
-    const image = await EncryptedImage.findById(req.params.id);
-    if (!image) {
-      return res.status(404).json({ error: 'Image not found' });
-    }
-    
-    if (image.encryptionType !== 'steganography') {
-      return res.status(400).json({ error: 'Not a steganography image' });
-    }
-    
-    res.download(image.encryptedPath, 'stego_image.png');
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ==================== DEBUG/TEST ROUTES ====================
-router.get('/test-metrics', async (req, res) => {
-  try {
-    const metricsScript = path.join(__dirname, '../python/metrics_analyzer.py');
-    
-    res.json({
-      success: true,
-      message: 'Metrics script configuration',
-      pythonPath: PYTHON_CMD,
-      scriptPath: metricsScript,
-      scriptExists: fs.existsSync(metricsScript),
-      isRender: !!process.env.RENDER,
-      environment: process.env.NODE_ENV || 'development'
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    const doc = await EncryptedImage.findByIdAndDelete(req.params.id);
+    if (doc) del(doc.encryptedPath, doc.originalPath);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
