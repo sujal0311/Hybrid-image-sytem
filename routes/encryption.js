@@ -110,13 +110,7 @@ const cleanupUploads = (req) => {
   if (req.file) del(req.file.path);
   if (!req.files) return;
 
-  const entries = [
-    'secretImage',
-    'coverImage',
-    'secret',
-    'cover',
-    'stego',
-  ];
+  const entries = ["secretImage", "coverImage", "secret", "cover", "stego"];
 
   for (const key of entries) {
     const files = req.files[key];
@@ -682,8 +676,8 @@ router.post(
 
       res.json({ success: true, fileId: doc._id, metrics: result.metrics });
     } catch (e) {
-      res.status(500).json({ error: e.message });    } finally {
-      cleanupUploads(req);    } finally {
+      res.status(500).json({ error: e.message });
+    } finally {
       cleanupUploads(req);
     }
   },
