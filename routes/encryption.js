@@ -105,6 +105,27 @@ const del = (...paths) =>
     } catch (_) {}
   });
 
+const cleanupUploads = (req) => {
+  if (!req) return;
+  if (req.file) del(req.file.path);
+  if (!req.files) return;
+
+  const entries = [
+    'secretImage',
+    'coverImage',
+    'secret',
+    'cover',
+    'stego',
+  ];
+
+  for (const key of entries) {
+    const files = req.files[key];
+    if (Array.isArray(files)) {
+      del(...files.map((file) => file.path));
+    }
+  }
+};
+
 // ── FIX: Reliable filename builder for decrypted outputs ─────────────────────
 /**
  * Strips any encrypted-file suffixes and returns a clean base name.
@@ -235,8 +256,9 @@ router.post("/encrypt", imageMulter.single("image"), async (req, res) => {
 
     res.json({ success: true, fileId: doc._id, metrics: result.metrics });
   } catch (error) {
-    if (req.file) del(req.file.path);
     res.status(500).json({ error: error.message });
+  } finally {
+    cleanupUploads(req);
   }
 });
 
@@ -315,6 +337,8 @@ router.post(
       res.json({ success: true, fileId: doc._id, metrics: result.metrics });
     } catch (error) {
       res.status(500).json({ error: error.message });
+    } finally {
+      cleanupUploads(req);
     }
   },
 );
@@ -386,6 +410,8 @@ router.post("/encrypt-video", videoMulter.single("video"), async (req, res) => {
     res.json({ success: true, fileId: doc._id, metrics: result.metrics });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  } finally {
+    cleanupUploads(req);
   }
 });
 
@@ -456,6 +482,8 @@ router.post("/encrypt-audio", audioMulter.single("audio"), async (req, res) => {
     res.json({ success: true, fileId: doc._id, metrics: result.metrics });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  } finally {
+    cleanupUploads(req);
   }
 });
 
@@ -551,6 +579,8 @@ router.post(
       res.json({ success: true, fileId: doc._id, metrics: result.metrics });
     } catch (e) {
       res.status(500).json({ error: e.message });
+    } finally {
+      cleanupUploads(req);
     }
   },
 );
@@ -652,7 +682,9 @@ router.post(
 
       res.json({ success: true, fileId: doc._id, metrics: result.metrics });
     } catch (e) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: e.message });    } finally {
+      cleanupUploads(req);    } finally {
+      cleanupUploads(req);
     }
   },
 );

@@ -184,9 +184,15 @@ def read_audio(path: str):
                     }
                     return frames, metadata
                 except Exception as e2:
-                    raise Exception(f'Failed to read WAV file: {str(e)}')
+                    raise Exception(f'Failed to read WAV file: {str(e2)}')
             else:
                 raise Exception(f'Failed to read WAV file: {str(e)}')
+
+    # Unsupported formats without librosa/soundfile
+    raise Exception(
+        f"Unsupported audio format '{file_ext}' without librosa/soundfile installed. "
+        "Install the required libraries or convert your audio to WAV."
+    )
 
 def wav_to_mp3(wav_path: str, mp3_path: str) -> bool:
     """Convert WAV to MP3 using FFmpeg. Returns True if successful."""

@@ -1,3 +1,11 @@
+# Python dependencies required by backend audio/video encryption helpers
 numpy
-pillow
+Pillow
+opencv-python-headless
 pycryptodome
+librosa
+soundfile
+pydub
+
+# Use the standard library wave module for WAV when no third-party audio backend is available.
+# Render will install only the direct runtime dependencies needed by the Python scripts.

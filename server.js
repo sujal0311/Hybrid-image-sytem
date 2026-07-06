@@ -40,7 +40,12 @@ app.use(express.urlencoded({ extended: true, limit: "2gb" }));
 
 const allowedOrigins = process.env.FRONTEND_URL
   ? process.env.FRONTEND_URL.split(",").map((o) => o.trim())
-  : ["http://localhost:5173", "http://localhost:3000","https://imagesystem2025.netlify.app"];
+  : [
+      "http://localhost:5173",
+      "http://localhost:3000",
+      "https://imagesystem2025.netlify.app",
+      "https://hybrid-image-sytem.onrender.com",
+    ];
 
 app.use(
   cors({

@@ -4,7 +4,7 @@ services:
     env: node
     region: singapore
     plan: free
-    buildCommand: npm install && pip3 install -r requirements.txt
+    buildCommand: npm install && pip3 install --no-cache-dir -r requirements.txt
     startCommand: node server.js
     envVars:
       - key: NODE_ENV

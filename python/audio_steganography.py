@@ -192,9 +192,15 @@ def _read_audio(path):
                     }
                     return frames, metadata
                 except Exception as e2:
-                    raise Exception(f'Failed to read WAV file: {str(e)}')
+                    raise Exception(f'Failed to read WAV file: {str(e2)}')
             else:
                 raise Exception(f'Failed to read WAV file: {str(e)}')
+
+    # Unsupported formats without librosa/soundfile
+    raise Exception(
+        f"Unsupported audio format '{file_ext}' without librosa/soundfile installed. "
+        "Install the required libraries or convert your audio to WAV."
+    )
 
 def _write_audio(path, frames, metadata):
     """Write audio to WAV file"""
